@@ -14,18 +14,18 @@ from utils import *
 # openai.api_version =
 
 # Put your query here
-QUERY = r"""What 8 letter word can have a letter taken away and it still makes a word. Take another letter away and it still makes a word. Keep on doing that until you have one letter left. What is the word?"""
+QUERY = r"""What is the best soccor player"""
 
 EXP_NAME = "trial_1"
-MODEL = "chatgpt0301"
+MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 
 ACTIVATION = "listwise"
 TYPE = "open-ended"
 DIR_NAME = "trial"
-
+GENERATION_MODE = "bias"
 # Here are the roles of the participants in the LLM-agent collaboration
 # See prompt_lib.ROLE_MAP for the full list of roles
-ROLES = ["Assistant", "Assistant", "Assistant", "Assistant"]
+ROLES = ["Assistant", "Assistant"]
 
 def set_rd_seed(seed):
     random.seed(seed)
@@ -34,7 +34,7 @@ def main():
     set_rd_seed(0)
     assert len(ROLES) > 0
 
-    llmlp = LLMLP(MODEL, len(ROLES), ROLES, 3, ACTIVATION, TYPE, MODEL)
+    llmlp = LLMLP(MODEL, len(ROLES), ROLES, 3, ACTIVATION, TYPE, MODEL, GENERATION_MODE)
 
     llmlp.zero_grad()
     res, resp_cnt, completions, prompt_tokens, completion_tokens = llmlp.forward(QUERY)

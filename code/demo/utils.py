@@ -6,8 +6,36 @@ import pandas as pd
 from prompt_lib import MMLU_QUESTION, COMPLEX_COT_EXAMPLES, TEMPERATURE, MAX_TOKENS
 import openai
 import backoff
+import torch
 from openai.error import RateLimitError, APIError, ServiceUnavailableError, APIConnectionError, Timeout
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
+def construct_biased_attention_matrix(seq_len, biased_ranges, max_len, device):
+    """
+    Constructs a padded biased attention matrix.
+
+    Parameters:
+    - seq_len: The actual sequence length of the input.
+    - biased_ranges: List of [start, end] indices defining biased position ranges.
+    - max_len: The maximum sequence length for padding.
+
+    Returns:
+    - A numpy array representing the padded biased attention matrix.
+    """
+    # Initialize the attention matrix with -inf for masking
+    attention_matrix = torch.triu(torch.full((max_len, max_len), float('-inf'), dtype=torch.bfloat16, device = device), diagonal= 1)
+
+    if biased_ranges is not None:
+        for range in biased_ranges:
+            i = range[0]
+            j = range[1]
+
+            attention_matrix[i : j, 0 : i] = float('-inf')
+    
+    attention_matrix[seq_len :, :] = float('-inf')
+    attention_matrix[: ,seq_len :] = float('-inf')
+
+    return attention_matrix
 
 class OutOfQuotaException(Exception):
     "Raised when the key exceeded the current quota"
@@ -332,7 +360,7 @@ def generate_answer(answer_context, model):
                   engine=model,
                   messages=answer_context,
                   temperature=TEMPERATURE,
-                  max_tokens=MAX_TOKENS,
+                  max_length=MAX_TOKENS,
                   n=1)
     except RateLimitError as e:
         if "You exceeded your current quota, please check your plan and billing details" in e.user_message:
@@ -343,6 +371,120 @@ def generate_answer(answer_context, model):
             raise e
 
     return completion["choices"][0]["message"]["content"], completion["usage"]["prompt_tokens"], completion["usage"]["completion_tokens"]
+
+def generate_answer_llama(answer_context, model_name, mode="normal", tokenizer = None):
+    print(1)
+    # model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, attn_implementation='sdpa')
+    # tokenizer = AutoTokenizer.from_pretrained(model_name, add_special_tokens = False, return_tensor="pt")
+    model = model_name
+    tokenizer = tokenizer
+    prompt = "<|begin_of_text|>"
+    for msg in answer_context:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        prompt += f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
+
+    if mode == "normal":
+        input_ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids
+
+        generation_output = model.generate(
+            input_ids=input_ids,
+            # max_length=MAX_TOKENS,
+            max_new_tokens = 200,
+            # temperature=TEMPERATURE,
+            do_sample=False
+        )
+
+
+    elif mode == "reencode":
+        pattern = r'(<MEM_START>.*?<MEM_END><MEM_SUM>)'
+        parts = re.split(pattern, prompt)
+        id_list = []
+        biased_index = []
+        current_index = 0
+        for part in parts:
+            if part == "": 
+                continue
+
+            if "<MEM_START>" in part:
+                tem_id = tokenizer(part, add_special_tokens=False, return_tensors="pt").input_ids
+                id_list.append(tem_id)
+                biased_index.append([current_index, current_index + tem_id.size(1) - 1])
+                current_index += tem_id.size(1)
+            
+            else:
+                tem_id = tokenizer(part, add_special_tokens=False, return_tensors="pt").input_ids
+                id_list.append(tem_id)
+                current_index += tem_id.size(1)
+
+        input_ids = torch.cat(id_list, dim = 1).to(model.device)
+        attention_matrix = construct_biased_attention_matrix(input_ids.size(1), biased_index, input_ids.size(1), model.device).unsqueeze(0).unsqueeze(0)
+
+        with torch.no_grad():
+            outputs = model(input_ids = input_ids, attention_mask = attention_matrix)
+            past_key_values = outputs.past_key_values
+
+            generation_output = model.generate(
+                input_ids=input_ids,
+                max_length=MAX_TOKENS,
+                do_sample=False,
+                temperature=None,
+                top_p=1.0,
+                past_key_values=past_key_values,
+                use_cache=True
+            )
+
+    elif mode == "bias":
+        pattern = r'(<MEM_START>.*?<MEM_END>)'
+        parts = re.split(pattern, prompt)
+        id_list = []
+        biased_index = []
+        current_index = 0
+        for part in parts:
+            if part == "": 
+                continue
+
+            if "<MEM_START>" in part:
+                tem_id = tokenizer(part, add_special_tokens=False, return_tensors="pt").input_ids
+                id_list.append(tem_id)
+                biased_index.append([current_index, current_index + tem_id.size(1)])
+                current_index += tem_id.size(1)
+            
+            else:
+                tem_id = tokenizer(part, add_special_tokens=False, return_tensors="pt").input_ids
+                id_list.append(tem_id)
+                current_index += tem_id.size(1)
+    
+        input_ids = torch.cat(id_list, dim = 1).to(model.device)
+        attention_matrix = construct_biased_attention_matrix(input_ids.size(1), biased_index, input_ids.size(1), model.device).unsqueeze(0).unsqueeze(0)
+
+        with torch.no_grad():
+            outputs = model(input_ids = input_ids, attention_mask = attention_matrix)
+            past_key_values = outputs.past_key_values
+
+            input_ids = torch.cat([input_ids, tokenizer("Think step by step.", add_special_tokens=False, return_tensors="pt").input_ids.to(model.device)], dim = 1)
+
+            generation_output = model.generate(
+                input_ids=input_ids,
+                max_length=MAX_TOKENS,
+                do_sample=False,
+                temperature=None,
+                top_p=1.0,
+                past_key_values=past_key_values,
+                use_cache=True
+            )
+
+    # Separate the prompt from the newly generated text
+    # The generated sequence includes both the prompt and completion
+    # We only want the newly generated portion after the prompt
+    generated_ids = generation_output[0][input_ids.shape[-1]:]
+    completion_text =  tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    # Count tokens for prompt and completion
+    prompt_tokens = input_ids.shape[-1]
+    completion_tokens = len(generated_ids)
+
+    return completion_text, prompt_tokens, completion_tokens
 
 def parse_single_choice(reply):
     pattern = r'\(([ABCDabcd])\)'

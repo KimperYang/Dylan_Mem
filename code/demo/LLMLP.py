@@ -1,5 +1,7 @@
+import torch
 import math
 import random
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from LLM_Neuron import LLMNeuron, LLMEdge, listwise_ranker_2
 from utils import parse_single_choice, most_frequent, is_equiv, extract_math_answer
 from sacrebleu import sentence_bleu
@@ -11,13 +13,15 @@ ACTIVATION_MAP = {'listwise': 0, 'trueskill': 1, 'window': 2, 'none': -1} # TODO
 class LLMLP:
     
     def __init__(self, default_model_name, agents=4, agent_roles=[],
-                 rounds=2, activation="listwise", qtype="single_choice", mtype="gpt-3.5-turbo"):
+                 rounds=2, activation="listwise", qtype="single_choice", mtype="meta-llama/Llama-3.2-1B-Instruct", gtype = "normal"):
         self.default_model_name = default_model_name
         self.agents = agents
         self.rounds = rounds
         self.activation = ACTIVATION_MAP[activation]
-        self.mtype = mtype
-        
+        self.model = AutoModelForCausalLM.from_pretrained(mtype, torch_dtype=torch.bfloat16, attn_implementation='sdpa')
+        self.tokenizer = AutoTokenizer.from_pretrained(mtype, add_special_tokens = False, return_tensor="pt")
+        self.gtype = gtype
+
         assert len(agent_roles) == agents and agents > 0
         self.agent_roles = agent_roles
         self.qtype = qtype
@@ -38,12 +42,12 @@ class LLMLP:
     def init_nn(self, activation, agent_roles):
         self.nodes, self.edges = [], []
         for idx in range(self.agents):
-            self.nodes.append(LLMNeuron(agent_roles[idx], self.mtype, self.ans_parser, self.qtype))
+            self.nodes.append(LLMNeuron(agent_roles[idx], self.model, self.ans_parser, self.qtype, self.gtype, self.tokenizer))
         
         agents_last_round = self.nodes[:self.agents]
         for rid in range(1, self.rounds):
             for idx in range(self.agents):
-                self.nodes.append(LLMNeuron(agent_roles[idx], self.mtype, self.ans_parser, self.qtype))
+                self.nodes.append(LLMNeuron(agent_roles[idx], self.model, self.ans_parser, self.qtype, self.gtype, self.tokenizer))
                 for a1 in agents_last_round:
                     self.edges.append(LLMEdge(a1, self.nodes[-1]))
             agents_last_round = self.nodes[-self.agents:]
@@ -131,7 +135,7 @@ class LLMLP:
                 random.shuffle(indices)
                 shuffled_replies = [replies[idx] for idx in indices]
             
-                tops, prompt_tokens, completion_tokens = self.activation(shuffled_replies, question, self.qtype, self.mtype)
+                tops, prompt_tokens, completion_tokens = self.activation(shuffled_replies, question, self.qtype, self.model, self.gtype, self.tokenizer)
                 total_prompt_tokens += prompt_tokens
                 total_completion_tokens += completion_tokens
                 idx_mask = list(map(lambda x: idxs[indices[x]] % self.agents, tops))

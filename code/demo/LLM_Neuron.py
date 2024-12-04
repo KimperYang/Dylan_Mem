@@ -1,15 +1,18 @@
 import random
 import re
-from utils import parse_single_choice, generate_answer
+from utils import parse_single_choice, generate_answer, generate_answer_llama
 from prompt_lib import ROLE_MAP, construct_ranking_message, construct_message, SYSTEM_PROMPT_MMLU, ROLE_MAP_MATH, SYSTEM_PROMPT_MATH
 
 
 class LLMNeuron:
     
-    def __init__(self, role, mtype="gpt-3.5-turbo", ans_parser=parse_single_choice, qtype="single_choice"):
+    # def __init__(self, role, mtype="gpt-3.5-turbo", ans_parser=parse_single_choice, qtype="single_choice"):
+    def __init__(self, role, mtype="meta-llama/Llama-3.2-1B-Instruct", ans_parser=parse_single_choice, qtype="single_choice", gtype = "normal", tokenizer = None):
         self.role = role
         self.model = mtype
+        self.tokenizer = tokenizer
         self.qtype = qtype
+        self.gtype = gtype
         self.ans_parser = ans_parser
         self.reply = None
         self.answer = ""
@@ -71,8 +74,9 @@ class LLMNeuron:
         shuffled_idxs = [mess[1] for mess in formers]
         formers = [mess[0] for mess in formers]
 
-        contexts.append(construct_message(formers, question, self.qtype))
-        self.reply, self.prompt_tokens, self.completion_tokens = generate_answer(contexts, self.model)
+        contexts.append(construct_message(formers, question, self.qtype, self.gtype))
+        # self.reply, self.prompt_tokens, self.completion_tokens = generate_answer(contexts, self.model)
+        self.reply, self.prompt_tokens, self.completion_tokens = generate_answer_llama(contexts, self.model, self.gtype, self.tokenizer)
         # parse answer
         self.answer = self.ans_parser(self.reply)
         weights = self.weights_parser(self.reply)
@@ -116,7 +120,7 @@ class LLMNeuron:
             return []
 
         contexts, formers = self.get_context()
-        contexts.append(construct_message([mess[0] for mess in formers], self.question, self.qtype))
+        contexts.append(construct_message([mess[0] for mess in formers], self.question, self.qtype, self.gtype))
         contexts.append({"role": "assistant", "content": self.reply})
         return contexts
 
@@ -154,8 +158,9 @@ def parse_ranks(completion, max_num=4):
 
     return tops
 
-def listwise_ranker_2(responses, question, qtype, model="chatgpt0301"):
+def listwise_ranker_2(responses, question, qtype, model="meta-llama/Llama-3.2-1B-Instruct", gtype="normal", tokenizer = None):
     assert 2 < len(responses)# <= 4
-    message = construct_ranking_message(responses, question, qtype)
-    completion, prompt_tokens, completion_tokens = generate_answer([message], model)
+    message = construct_ranking_message(responses, question, qtype, gtype)
+    # completion, prompt_tokens, completion_tokens = generate_answer([message], model)
+    completion, prompt_tokens, completion_tokens = generate_answer_llama([message], model, gtype, tokenizer)
     return parse_ranks(completion, max_num=len(responses)), prompt_tokens, completion_tokens
