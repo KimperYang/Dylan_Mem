@@ -7,6 +7,8 @@ import random
 import openai
 import sys
 import os
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from util import _strip_string, extract_math_answer, is_equiv
 import backoff
 from openai.error import RateLimitError, APIError, ServiceUnavailableError, APIConnectionError, Timeout
@@ -20,6 +22,8 @@ MODEL = sys.argv[4]
 ENGINE = sys.argv[5]
 DIR_NAME = "llmlp_math_" + MODEL
 RESPONSES_TOTAL = DIR_NAME+"/responses_total.txt"
+MODE = "normal"
+mtype = "meta-llama/Llama-3.2-1B-Instruct"
 SYSTEM_PROMPT = "It's a debate. Explain your reasons at each round thoroughly.\n Follow the given examples and answer the mathematics problem."
 EXAMPLES = """Problem: There are 15 trees in the grove. Grove workers will plant trees in the grove today. After they are done, there will be 21 trees. How many trees did the grove workers plant today?
 Answer: There are 15 trees originally. Then there were 21 trees after the Grove workers planted some more. So there must have been 21 - 15 = 6 trees that were planted. The answer is 6.
@@ -50,7 +54,34 @@ Answer: Olivia had 23 dollars. She bought 5 bagels for 3 dollars each. So she sp
 # openai.api_type =
 # openai.api_version =
 
-def construct_message(agents, question):
+def construct_biased_attention_matrix(seq_len, biased_ranges, max_len, device):
+    """
+    Constructs a padded biased attention matrix.
+
+    Parameters:
+    - seq_len: The actual sequence length of the input.
+    - biased_ranges: List of [start, end] indices defining biased position ranges.
+    - max_len: The maximum sequence length for padding.
+
+    Returns:
+    - A numpy array representing the padded biased attention matrix.
+    """
+    # Initialize the attention matrix with -inf for masking
+    attention_matrix = torch.triu(torch.full((max_len, max_len), float('-inf'), dtype=torch.bfloat16, device = device), diagonal= 1)
+
+    if biased_ranges is not None:
+        for range in biased_ranges:
+            i = range[0]
+            j = range[1]
+
+            attention_matrix[i : j, 0 : i] = float('-inf')
+    
+    attention_matrix[seq_len :, :] = float('-inf')
+    attention_matrix[: ,seq_len :] = float('-inf')
+
+    return attention_matrix
+
+def construct_message(agents, question, mode):
     if len(agents) == 0:
         # unused
         return {"role": "user", "content": "Can you double check that your answer is correct. Put your final answer in the form (X) at the end of your response. (X) represents choice (A), (B), (C), (D)."}
@@ -59,15 +90,22 @@ def construct_message(agents, question):
 
     for agent in agents:
         agent_response = agent[-1]["content"]
-        response = "\n\nOne agent solution: ```{}```".format(agent_response)
-
+        if mode == "normal":
+            response = "\n\nOne agent solution: ```{}```".format(agent_response)
+        elif mode == "bias":
+            response = "<MEM_START>" + "\n\nOne agent solution: ```{}```".format(agent_response) + "<MEM_END>"
+        elif mode == "reencode":
+            response = "<MEM_START>" + "\n\nOne agent solution: ```{}```".format(agent_response) + "<MEM_END><MEM_SUM>"
         prefix_string = prefix_string + response
+    
+    if mode == "bias":
+        prefix_string += "<MEM_SUM>"
 
     prefix_string = prefix_string + """\n\nUsing the reasoning from other agents as additional advice with critical thinking, can you give an updated answer? Examine your solution and that other agents step by step. Notice that the former answers might be all wrong.""".format(question)
     return {"role": "user", "content": prefix_string}
 
 
-def construct_ranking_message(agents, question):
+def construct_ranking_message(agents, question, mode):
     if len(agents) == 0:
         return {"role": "user", "content": "Can you double check that your answer is correct. Put your final answer in the form (X) at the end of your response. (X) represents choice (A), (B), (C), (D)."}
 
@@ -75,39 +113,153 @@ def construct_ranking_message(agents, question):
 
     for aid, agent in enumerate(agents, 1):
         agent_response = agent[-1]["content"]
-        response = "\n\nAgent solution " + str(aid) + ": ```{}```".format(agent_response)
+        if mode == "normal":
+            response = "\n\nAgent solution " + str(aid) + ": ```{}```".format(agent_response)
+        elif mode == "bias":
+            response = "<MEM_START>" + "\n\nAgent solution " + str(aid) + ": ```{}```".format(agent_response) + "<MEM_END>"
+        elif mode == "reencode":
+            response = "<MEM_START>" +"\n\nAgent solution " + str(aid) + ": ```{}```".format(agent_response) + "<MEM_END><MEM_SUM>"
 
         prefix_string = prefix_string + response
+
+    if mode == "bias":
+        prefix_string += "<MEM_SUM>"
 
     prefix_string = prefix_string + "\n\nPlease choose the best 2 solutions and think step by step. Put your answer in the form like [1,2] or [3,4] at the end of your response.".format(question)
     return {"role": "user", "content": prefix_string} #TODO: add role as judge
 
 
 def construct_assistant_message(completion):
-    content = completion["choices"][0]["message"]["content"]
+    content = completion
     return {"role": "assistant", "content": content}
 
 
-@backoff.on_exception(backoff.expo, (RateLimitError, APIError, ServiceUnavailableError, APIConnectionError, Timeout), max_tries=20)
-def generate_answer(answer_context):
-    try:
-        completion = openai.ChatCompletion.create(
-                #   model=MODEL,
-                  engine=ENGINE,
-                  messages=answer_context,
-                  temperature=0.2,
-                  max_tokens=2048,
-                  n=1)
-    except RateLimitError as e:
-        if "You exceeded your current quota, please check your plan and billing details" in e.user_message:
-            raise OutOfQuotaException(openai.api_key)
-        elif "Your access was terminated due to violation of our policies" in e.user_message:
-            raise AccessTerminatedException(openai.api_key)
-        else:
-            raise e
+# @backoff.on_exception(backoff.expo, (RateLimitError, APIError, ServiceUnavailableError, APIConnectionError, Timeout), max_tries=20)
+# def generate_answer(answer_context):
+#     try:
+#         completion = openai.ChatCompletion.create(
+#                 #   model=MODEL,
+#                   engine=ENGINE,
+#                   messages=answer_context,
+#                   temperature=0.2,
+#                   max_tokens=2048,
+#                   n=1)
+#     except RateLimitError as e:
+#         if "You exceeded your current quota, please check your plan and billing details" in e.user_message:
+#             raise OutOfQuotaException(openai.api_key)
+#         elif "Your access was terminated due to violation of our policies" in e.user_message:
+#             raise AccessTerminatedException(openai.api_key)
+#         else:
+#             raise e
 
-    return completion
+#     return completion
 
+
+def generate_answer_llama(answer_context, mode="normal", model_name=None, tokenizer = None):
+    # model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, attn_implementation='sdpa')
+    # tokenizer = AutoTokenizer.from_pretrained(model_name, add_special_tokens = False, return_tensor="pt")
+    model = model_name
+    tokenizer = tokenizer
+    prompt = "<|begin_of_text|>"
+    for msg in answer_context:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        prompt += f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
+
+    if mode == "normal":
+        input_ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(model.device)
+
+        generation_output = model.generate(
+            input_ids=input_ids,
+            max_length=2048,
+            # max_new_tokens = 200,
+            # temperature=TEMPERATURE,
+            do_sample=False
+        )
+
+
+    elif mode == "reencode":
+        pattern = r'(<MEM_START>.*?<MEM_END><MEM_SUM>)'
+        parts = re.split(pattern, prompt)
+        id_list = []
+        biased_index = []
+        current_index = 0
+        for part in parts:
+            if part == "": 
+                continue
+
+            if "<MEM_START>" in part:
+                tem_id = tokenizer(part, add_special_tokens=False, return_tensors="pt").input_ids
+                id_list.append(tem_id)
+                biased_index.append([current_index, current_index + tem_id.size(1) - 1])
+                current_index += tem_id.size(1)
+            
+            else:
+                tem_id = tokenizer(part, add_special_tokens=False, return_tensors="pt").input_ids
+                id_list.append(tem_id)
+                current_index += tem_id.size(1)
+
+        input_ids = torch.cat(id_list, dim = 1).to(model.device)
+        attention_matrix = construct_biased_attention_matrix(input_ids.size(1), biased_index, input_ids.size(1), model.device).unsqueeze(0).unsqueeze(0)
+
+        with torch.no_grad():
+            outputs = model(input_ids = input_ids, attention_mask = attention_matrix)
+            past_key_values = outputs.past_key_values
+
+            generation_output = model.generate(
+                input_ids=input_ids,
+                max_length=2048,
+                do_sample=False,
+                temperature=None,
+                top_p=1.0,
+                past_key_values=past_key_values,
+                use_cache=True
+            )
+
+    elif mode == "bias":
+        pattern = r'(<MEM_START>.*?<MEM_END>)'
+        parts = re.split(pattern, prompt)
+        id_list = []
+        biased_index = []
+        current_index = 0
+        for part in parts:
+            if part == "": 
+                continue
+
+            if "<MEM_START>" in part:
+                tem_id = tokenizer(part, add_special_tokens=False, return_tensors="pt").input_ids
+                id_list.append(tem_id)
+                biased_index.append([current_index, current_index + tem_id.size(1)])
+                current_index += tem_id.size(1)
+            
+            else:
+                tem_id = tokenizer(part, add_special_tokens=False, return_tensors="pt").input_ids
+                id_list.append(tem_id)
+                current_index += tem_id.size(1)
+    
+        input_ids = torch.cat(id_list, dim = 1).to(model.device)
+        attention_matrix = construct_biased_attention_matrix(input_ids.size(1), biased_index, input_ids.size(1), model.device).unsqueeze(0).unsqueeze(0)
+
+        with torch.no_grad():
+            outputs = model(input_ids = input_ids, attention_mask = attention_matrix)
+            past_key_values = outputs.past_key_values
+
+            input_ids = torch.cat([input_ids, tokenizer("Think step by step.", add_special_tokens=False, return_tensors="pt").input_ids.to(model.device)], dim = 1)
+
+            generation_output = model.generate(
+                input_ids=input_ids,
+                max_length=2048,
+                do_sample=False,
+                temperature=None,
+                top_p=1.0,
+                past_key_values=past_key_values,
+                use_cache=True
+            )
+
+    generated_ids = generation_output[0][input_ids.shape[-1]:]
+    completion_text =  tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    return completion_text
 
 def parse_question_answer(subdir, file):
     
@@ -154,7 +306,7 @@ def parse_question_answer(subdir, file):
         return question, prob_level, prob_type, answer
 
 def parse_ranks(completion):
-    content = completion["choices"][0]["message"]["content"]
+    content = completion
     pattern = r'\[([1234]),\s*([1234])\]'
     matches = re.findall(pattern, content)
 
@@ -205,6 +357,12 @@ def check_reach_consensus(agent_contexts):
 
 
 if __name__ == "__main__":
+    if MODE == "normal":
+        model = AutoModelForCausalLM.from_pretrained(mtype, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2')
+    else:
+        model = AutoModelForCausalLM.from_pretrained(mtype, torch_dtype=torch.bfloat16, attn_implementation='sdpa')
+    model.to('cuda')
+    tokenizer = AutoTokenizer.from_pretrained(mtype, add_special_tokens = False, return_tensor="pt")
     agents = 4
     rounds = 3
 
@@ -227,7 +385,7 @@ if __name__ == "__main__":
             consensus = False
             for i, agent_context in enumerate(agent_contexts):
                 print(idx, 0, i, agent_context, "\n")
-                completion = generate_answer(agent_context)
+                completion = generate_answer_llama(agent_context, MODE, model, tokenizer)
 
                 assistant_message = construct_assistant_message(completion)
                 agent_context.append(assistant_message)
@@ -244,13 +402,13 @@ if __name__ == "__main__":
                 continue
 
             consensus = False
-            message = construct_message(agent_contexts, question)
+            message = construct_message(agent_contexts, question, MODE)
             for i, agent_context in enumerate(agent_contexts):
                 agent_context.pop()
                 agent_context.pop()
                 agent_context.append(message)
                 print(idx, 1, i, agent_context, "\n")
-                completion = generate_answer(agent_context)
+                completion = generate_answer_llama(agent_context, MODE, model, tokenizer)
 
                 assistant_message = construct_assistant_message(completion)
                 agent_context.append(assistant_message)
@@ -267,8 +425,8 @@ if __name__ == "__main__":
                 continue
 
             # TODO: PageRanker
-            message = construct_ranking_message(agent_contexts, question)
-            completion = generate_answer([message])
+            message = construct_ranking_message(agent_contexts, question, MODE)
+            completion = generate_answer_llama([message], MODE, model, tokenizer)
             total_responses += 1
             print(completion, "\n")
             tops = parse_ranks(completion)
@@ -278,13 +436,13 @@ if __name__ == "__main__":
                 response_dict[question] = (agent_contexts, answer, prob_level, prob_type)
                 continue
 
-            message = construct_message(agent_contexts, question)
+            message = construct_message(agent_contexts, question, MODE)
             for i, agent_context in enumerate(agent_contexts):
                 agent_context.pop()
                 agent_context.pop()
                 agent_context.append(message)
                 print(idx, 2, i, agent_context, "\n")
-                completion = generate_answer(agent_context)
+                completion = generate_answer_llama(agent_context, MODE, model, tokenizer)
                 total_responses += 1
 
                 assistant_message = construct_assistant_message(completion)

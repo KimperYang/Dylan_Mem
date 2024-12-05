@@ -6,7 +6,7 @@ ENGINE=chatgpt0301
 # ENGINE=gpt4
 
 # specify your directory
-dir="<path-to-your-directory>"
+dir="/home/jingbo/DyLAN_mem/data/MATH/test_s"
 
 # loop over sub-directories
 for subdir in "$dir"/*

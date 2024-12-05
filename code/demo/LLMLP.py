@@ -22,6 +22,8 @@ class LLMLP:
         self.tokenizer = AutoTokenizer.from_pretrained(mtype, add_special_tokens = False, return_tensor="pt")
         self.gtype = gtype
 
+        self.model.to('cuda')
+
         assert len(agent_roles) == agents and agents > 0
         self.agent_roles = agent_roles
         self.qtype = qtype

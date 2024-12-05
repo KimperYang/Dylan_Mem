@@ -373,7 +373,6 @@ def generate_answer(answer_context, model):
     return completion["choices"][0]["message"]["content"], completion["usage"]["prompt_tokens"], completion["usage"]["completion_tokens"]
 
 def generate_answer_llama(answer_context, model_name, mode="normal", tokenizer = None):
-    print(1)
     # model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, attn_implementation='sdpa')
     # tokenizer = AutoTokenizer.from_pretrained(model_name, add_special_tokens = False, return_tensor="pt")
     model = model_name
@@ -473,7 +472,6 @@ def generate_answer_llama(answer_context, model_name, mode="normal", tokenizer =
                 past_key_values=past_key_values,
                 use_cache=True
             )
-
     # Separate the prompt from the newly generated text
     # The generated sequence includes both the prompt and completion
     # We only want the newly generated portion after the prompt
